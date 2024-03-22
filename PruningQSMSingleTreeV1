@@ -1,0 +1,221 @@
+function [cutratlst,orderlst,cutimelst] = pruning(QSM)
+    len = length(QSM);  %获取树枝的数量
+    rows_cols = ceil(sqrt(len )); % 绘图用，获取行列数
+    cutratlst = zeros(len, 2); % 初始化修剪体积和修剪比例的存储列表
+    %orderlst = zeros(len, 27); %初始化各级树枝的修剪体积、保留体积和总体积的存储列表
+    orderlst = zeros(len, 9);
+    cutimelst = zeros(len,2);
+    
+    for te = 1:len  %遍历所有树
+        
+        tree = QSM(te); %获取单棵树的信息
+        TotalOrder = RatingCylinderVolumeAll(tree);
+        try
+            %策略1：+++++++++++++++++++++++++++整形修剪+++++++++++++++++++++++++++
+            prun_order = find(tree.branch.order > 0);%筛选出除了树干以外的树枝
+            prun_idx = []; %建立整形修剪保留树枝的存储集
+            for i = 1:length(prun_order) 
+                prun_bbr = prun_order(i);%
+                lidx = find(ismember(tree.cylinder.branch, prun_bbr));%对应树枝的圆柱体集合：lidx
+                cy_idx = [];%这一根树枝保留的圆柱体序号集：cy_idx
+                for c = 1:length(lidx)
+                    ci = lidx(c);%圆柱体：ci
+                    if (ci + 3) <= lidx(end)
+                        cyl1 = tree.cylinder.axis(ci,3);
+                        cyl2 = tree.cylinder.axis(ci+1,3);
+                        cyl3 = tree.cylinder.axis(ci+2,3);
+                        cyl4 = tree.cylinder.axis(ci+3,3);
+                        if cyl1 < 0 && cyl2 < 0 && cyl3 < 0 && cyl4 < 0
+                            break          
+                        else
+                            cy_idx = [cy_idx,ci];  
+                        end
+                    else
+                        if tree.cylinder.axis(ci,3) < 0
+                        	break
+                        else
+                            cy_idx = [cy_idx,ci];  
+                        end
+                    end
+                    prun_idx = union(prun_idx, cy_idx);
+                end
+            end
+            mainbbr = find(tree.branch.order == 0);
+            maincyl = find(ismember(tree.cylinder.branch, mainbbr));
+            prun_idx = union(prun_idx, maincyl);   %prun_idx是保留的圆柱体的集合
+            prun_time = cuttime(prun_idx, tree);   %修剪次数
+            pruningCyl = getCylinder(prun_idx, tree);
+            thinorder = RatingCylinderVolume(prun_idx,tree);
+
+            %策略2：+++++++++++++++++++++++++++截干修剪+++++++++++++++++++++++++++
+            crownheight = tree.treedata.TreeHeight - tree.treedata.CrownBaseHeight; 
+            limit_height = tree.treedata.TreeHeight - crownheight/2 + tree.cylinder.start(1,3);
+            %遍历一级枝，合并保留的一级枝和子枝
+            poll_idx = [];%建立截干的圆柱体序号集
+            hstree = []; %建立截干的高度限制集
+            main_order1 = find(tree.branch.order == 1 & tree.branch.diameter > tree.treedata.DBHqsm/4);
+            [h, ~] = sort(tree.branch.height(main_order1),'ascend'); 
+            order1 = find(tree.branch.order == 1 & tree.branch.height < h(1)+0.5 & tree.branch.height >= h(1));  %筛选出主要的1级枝 
+            for i = 1:length(order1)              
+                bbr1 = order1(i);
+                child_max = find(tree.branch.parent==bbr1 & tree.branch.diameter > tree.branch.diameter(bbr1)/4 & ...
+                    tree.branch.height < tree.treedata.TreeHeight - crownheight/2);%筛选出主要的2级枝
+                if isempty(child_max)
+                    %disp('没有符合的枝条');
+                    continue
+                end
+                maxd = find(tree.branch.volume == max(tree.branch.volume(child_max)));
+                %遍历二级枝，合并保留的二级枝和子枝
+                restidx = [];
+                hst2s = []; 
+                for m = 1:length(child_max) %遍历选出的2级枝
+                    order2 = child_max(m);
+                    order2h = tree.branch.height(order2);
+                    if order2h - h < 0.5
+                        order2s = getOrderDescendants(tree, order2); %子枝条
+                        limit_h = tree.branch.height(maxd) + 1.5 + tree.cylinder.start(1,3); %建立限高
+                    else
+                        order2s = getOrderDescendants(tree, order2); %子枝条
+                        limit_h = tree.branch.height(maxd) + 0.7 + tree.cylinder.start(1,3); %建立限高                       
+                    end
+                    idx2s = getCyHigher(order2s,tree,limit_h); %最粗枝条中保留（低于限高）的圆柱体
+                    restidx = union(restidx, idx2s);
+                    hst2s = union(hst2s, limit_h);
+                end
+                %建立限高
+                maxh2s = max(hst2s);
+                if maxh2s > limit_height
+                    maxh2s = limit_height;
+                end
+                order1cyl = getCyHigher(bbr1, tree, maxh2s);
+                order1s = union(restidx, order1cyl); 
+                poll_idx = union(poll_idx, order1s);
+                hstree = union(hstree,maxh2s);
+            end
+            mainbbr = find(tree.branch.order==0);
+            maincyl = getCyHigher(mainbbr,tree,max(hstree));
+            poll_idx = union(poll_idx, maincyl);
+            poll_time = cuttime(poll_idx, tree);   %修剪次数
+            pollardingCyl = getCylinder(poll_idx, tree);
+            pollorder = RatingCylinderVolume(poll_idx',tree);   %修剪级别和体积
+            
+            %修剪率制表
+            cutratio1 = getRestVolume(poll_idx, tree); 
+            cutratio2 = getRestVolume(prun_idx, tree); 
+            cutratlst(te, :) = [cutratio1, cutratio2]; %将修剪比例增加至修剪列表
+            cutimelst(te,:) = [prun_time,poll_time];
+            % 创建子图并绘制
+
+            subplot(rows_cols, rows_cols, te);
+            plot_cylinder_model(pruningCyl);
+            %plot_cylinder_model(pollardingCyl);
+            %plot_cylinder_model(tree.cylinder);
+            %title([num2str(te) ': ' num2str(roundn(cutratio2, -5)*100) '% '], 'FontSize', 3);
+            title(num2str(te));
+            set(gca, 'FontSize', 16);  % 设置轴标签的字体大小
+            fig = gcf;  % 获取当前图形
+            fig.PaperUnits = 'inches';
+            fig.PaperPosition = [0 0 8.27 11.69];  % 设置图像大小为A4纸的大小
+            print('output','-dpng','-r500');
+            
+            orderlst(te,:) = TotalOrder;
+        catch ME
+            disp(te);
+            disp(ME.message);
+            disp(['Error in line ', num2str(ME.stack(1).line)]);
+            continue;
+        end
+    end
+end
+
+
+%递归寻找下一级树枝
+function result = getOrderDescendants(tree, idx)
+    % 初始化结果向量
+    connected_branches = idx;
+    children = find(ismember([tree.branch.parent], idx)==1);
+    % 递归查找子级树枝
+    while ~isempty(children)
+        connected_branches = [connected_branches; children];
+        children = find(ismember([tree.branch.parent], children)==1);
+    end
+    % 合并并返回结果
+    result = [idx; connected_branches];
+    result = unique(result)';
+end
+
+%提取符合高度的圆柱体的编号
+function lidx_final = getCyHigher(bidx, tree, height)
+    lidx = find(ismember(tree.cylinder.branch, bidx) & tree.cylinder.start(:,3) < height);
+    lidx_final = [];
+    for c = 1:length(lidx)
+        ci = lidx(c);
+        if (ci + 2) <= lidx(end)
+            cyl1 = tree.cylinder.axis(ci,3);
+            cyl2 = tree.cylinder.axis(ci+1,3);
+            cyl3 = tree.cylinder.axis(ci+2,3);
+            if cyl1 < 0 && cyl2 < 0 && cyl3 < 0
+                break          
+            else
+                lidx_final = [lidx_final,ci];
+            end
+        else
+            if tree.cylinder.axis(ci,3) < 0
+                break
+            else
+                lidx_final = [lidx_final,ci];
+            end
+        end
+    end
+end
+
+%根据圆柱体编号获取修剪体积
+function volume = getRestVolume(idx, tree)  %输入圆柱体序号 获取圆柱体体积
+    area = pi * tree.cylinder.radius(idx).^2;
+    v = times(tree.cylinder.length(idx),area);
+    volume = (tree.treedata.TotalVolume - sum(v) * 1000)/tree.treedata.TotalVolume;
+end
+
+%根据圆柱体的编号获取圆柱体的等级和体积，并建立列表(用于修剪）
+function rCyl = RatingCylinderVolume(idx,tree)  %输入圆柱体序号，提取各个等级的圆柱体体积
+    rCyl = [];
+    for o = 0:8
+        idx1 = intersect(find(tree.cylinder.BranchOrder==o),idx);
+        idx2 = setdiff(find(tree.cylinder.BranchOrder==o), idx1);
+        v = sum(times(tree.cylinder.length(idx2),pi * tree.cylinder.radius(idx2).^2)).*1000;
+        rCyl = [rCyl, v];
+    end
+end
+
+%根据圆柱体的编号获取圆柱体的等级和体积，并建立列表(用于整体）
+function rCyl = RatingCylinderVolumeAll(tree)
+    rCyl = [];
+    for o = 0:8
+        idx1 = find(tree.cylinder.BranchOrder==o);
+        v = sum(times(tree.cylinder.length(idx1),pi * tree.cylinder.radius(idx1).^2)).*1000;
+        rCyl = [rCyl, v];
+    end
+end
+
+%根据圆柱体的编号建立圆柱体的建模列表
+function Cyl = getCylinder(idx, tree)
+    Cyl = struct();  % 初始化新结构体
+    for field = fieldnames(tree.cylinder)'  % 遍历所有字段
+        Cyl.(char(field)) = tree.cylinder.(char(field))(idx, :);  % 提取指定行数和字段到新结构体中
+    end
+end
+
+function cuttime = cuttime(idx, tree)
+    full = 1:length(tree.cylinder.branch)';
+    cutcyl = setdiff(full, idx);
+    bidx = unique(tree.cylinder.branch(cutcyl));
+    cuttime = 0;
+    for i = 1:length(bidx)
+        bo = bidx(i);
+        if tree.branch.length(bo)>0.3
+            cuttime = cuttime + 1;
+        else
+            continue
+        end
+    end
+end
